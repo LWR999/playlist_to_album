@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""
+playlist_to_album - Convert Roon exported playlists to album-like structure
+
+This script processes a Roon playlist export and converts it to look like an album
+by renaming tracks according to their playlist order and updating metadata.
+"""
+
+import argparse
+import os
+import sys
+import shutil
+from pathlib import Path
+from typing import List, Tuple, Set
+from io import BytesIO
+
+try:
+    from mutagen.flac import FLAC, Picture
+    from PIL import Image
+except ImportError as e:
+    print(f"ERROR: Missing required dependencies: {e}")
+    print("Please install required packages:")
+    print("  pip install mutagen Pillow")
+    sys.exit(1)
+
+
+class PlaylistProcessor:
+    def __init__(self, root_dir: Path, mode: str):
+        self.root_dir = root_dir.resolve()
+        self.mode = mode
+        self.playlists_dir = self.root_dir / "Playlists"
+        self.warnings: List[str] = []
+        
+    def log(self, message: str):
+        """Print log message to stdout"""
+        print(f"[{self.mode.upper()}] {message}")
+        
+    def find_m3u(self) -> Path:
+        """Find the .m3u file in Playlists folder"""
+        if not self.playlists_dir.exists():
+            raise FileNotFoundError(f"Playlists folder not found: {self.playlists_dir}")
+            
+        m3u_files = list(self.playlists_dir.glob("*.m3u"))
+        if not m3u_files:
+            raise FileNotFoundError(f"No .m3u file found in {self.playlists_dir}")
+        
+        if len(m3u_files) > 1:
+            self.log(f"WARNING: Multiple .m3u files found, using {m3u_files[0].name}")
+            
+        return m3u_files[0]
+    
+    def parse_m3u(self, m3u_path: Path) -> List[Tuple[int, Path]]:
+        """
+        Parse M3U file and return list of (track_number, absolute_path) tuples
+        
+        Returns:
+            List of (1-based track number, absolute path to FLAC file)
+        """
+        self.log(f"Parsing M3U: {m3u_path.name}")
+        tracks = []
+        
+        with open(m3u_path, 'r', encoding='utf-8-sig') as f:
+            for line_num, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                
+                # M3U paths are relative to the Playlists folder
+                # They start with ../ to go up to root, then artist/album/track
+                relative_path = Path(line)
+                absolute_path = (self.playlists_dir / relative_path).resolve()
+                
+                if not absolute_path.exists():
+                    raise FileNotFoundError(f"Track not found: {absolute_path}")
+                
+                tracks.append((line_num, absolute_path))
+        
+        self.log(f"Found {len(tracks)} tracks in playlist")
+        return tracks
+    
+    def resize_artwork(self, picture: Picture, max_size: int = 800) -> Picture:
+        """
+        Resize artwork maintaining aspect ratio, downscale only
+        
+        Args:
+            picture: mutagen Picture object
+            max_size: maximum dimension in pixels
+            
+        Returns:
+            New Picture object with resized image
+        """
+        img = Image.open(BytesIO(picture.data))
+        
+        # Only downscale if image is larger than max_size
+        if img.width <= max_size and img.height <= max_size:
+            return picture
+        
+        # Calculate new size maintaining aspect ratio
+        if img.width > img.height:
+            new_width = max_size
+            new_height = int((max_size / img.width) * img.height)
+        else:
+            new_height = max_size
+            new_width = int((max_size / img.height) * img.width)
+        
+        # Resize image
+        img_resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        
+        # Save to bytes
+        img_bytes = BytesIO()
+        img_format = img.format if img.format else 'JPEG'
+        img_resized.save(img_bytes, format=img_format)
+        
+        # Create new Picture object
+        new_picture = Picture()
+        new_picture.type = picture.type
+        new_picture.mime = picture.mime
+        new_picture.desc = picture.desc
+        new_picture.data = img_bytes.getvalue()
+        
+        return new_picture
+    
+    def process_track(self, track_num: int, total_tracks: int, 
+                     source_path: Path, processed_files: Set[Path]) -> Path:
+        """
+        Process a single FLAC track: update metadata, resize art, copy to root
+        
+        Args:
+            track_num: 1-based track number in playlist
+            total_tracks: total number of tracks in playlist
+            source_path: path to source FLAC file
+            processed_files: set to track which files have been processed
+            
+        Returns:
+            Path to the new file
+        """
+        processed_files.add(source_path)
+        
+        # Load FLAC metadata
+        audio = FLAC(source_path)
+        
+        # Get artist and title from metadata
+        artist = audio.get('artist', ['Unknown Artist'])[0]
+        title = audio.get('title', ['Unknown Title'])[0]
+        
+        # Create new filename: 01 - Artist Name - Track Title.flac
+        track_num_str = str(track_num).zfill(2)
+        new_filename = f"{track_num_str} - {artist} - {title}.flac"
+        # Sanitize filename
+        new_filename = "".join(c for c in new_filename if c not in r'\/:*?"<>|')
+        new_path = self.root_dir / new_filename
+        
+        self.log(f"Processing track {track_num}/{total_tracks}: {title}")
+        
+        # Copy file to new location
+        shutil.copy2(source_path, new_path)
+        
+        # Update metadata in the new file
+        new_audio = FLAC(new_path)
+        
+        # Update track and disc numbers
+        new_audio['tracknumber'] = f"{track_num}/{total_tracks}"
+        new_audio['discnumber'] = "1/1"
+        
+        # Resize artwork if present
+        if new_audio.pictures:
+            self.log(f"  Resizing artwork for track {track_num}")
+            resized_pictures = []
+            for picture in new_audio.pictures:
+                resized_pictures.append(self.resize_artwork(picture))
+            new_audio.clear_pictures()
+            for picture in resized_pictures:
+                new_audio.add_picture(picture)
+        
+        new_audio.save()
+        
+        return new_path
+    
+    def find_all_flacs(self) -> Set[Path]:
+        """Find all FLAC files in artist/album structure (not in Playlists)"""
+        all_flacs = set()
+        
+        for item in self.root_dir.iterdir():
+            if item.is_dir() and item.name != "Playlists":
+                # This is an artist folder
+                for flac in item.rglob("*.flac"):
+                    all_flacs.add(flac.resolve())
+        
+        return all_flacs
+    
+    def cleanup_input_data(self):
+        """Remove artist/album folders and Playlists folder"""
+        self.log("Cleaning up input data...")
+        
+        items_to_remove = []
+        
+        # Find all directories except those that are files we created
+        for item in self.root_dir.iterdir():
+            if item.is_dir():
+                items_to_remove.append(item)
+        
+        for item in items_to_remove:
+            self.log(f"  Removing: {item.name}")
+            shutil.rmtree(item)
+        
+        self.log("Cleanup complete")
+    
+    def run(self):
+        """Main processing logic"""
+        self.log(f"Starting playlist_to_album processing")
+        self.log(f"Root directory: {self.root_dir}")
+        
+        # Find and parse M3U
+        try:
+            m3u_path = self.find_m3u()
+        except FileNotFoundError as e:
+            print(f"ERROR: {e}")
+            sys.exit(1)
+        
+        if self.mode == "cleanup_only":
+            self.cleanup_input_data()
+            self.log("Processing complete (cleanup_only mode)")
+            return
+        
+        # Parse M3U to get track order
+        try:
+            tracks = self.parse_m3u(m3u_path)
+        except FileNotFoundError as e:
+            print(f"ERROR: {e}")
+            sys.exit(1)
+        
+        total_tracks = len(tracks)
+        processed_files = set()
+        
+        # Process each track
+        self.log(f"Processing {total_tracks} tracks...")
+        for track_num, source_path in tracks:
+            try:
+                self.process_track(track_num, total_tracks, source_path, processed_files)
+            except Exception as e:
+                print(f"ERROR processing track {track_num} ({source_path}): {e}")
+                sys.exit(1)
+        
+        # Check for unprocessed FLAC files
+        all_flacs = self.find_all_flacs()
+        unprocessed = all_flacs - processed_files
+        
+        if unprocessed:
+            self.log(f"WARNING: {len(unprocessed)} FLAC file(s) not in playlist:")
+            for flac in sorted(unprocessed):
+                rel_path = flac.relative_to(self.root_dir)
+                self.warnings.append(f"  {rel_path}")
+        
+        # Cleanup if in full mode
+        if self.mode == "full":
+            self.cleanup_input_data()
+        
+        # Print warnings at the end
+        if self.warnings:
+            print("\n" + "="*60)
+            print("WARNINGS:")
+            for warning in self.warnings:
+                print(warning)
+            print("="*60)
+        
+        self.log("Processing complete")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Convert Roon playlist export to album-like structure",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Modes:
+  convert_only  - Only convert tracks, don't delete input data
+  full          - Convert tracks and delete input data (default)
+  cleanup_only  - Only delete input data, don't process tracks
+  
+Example:
+  playlist_to_album /path/to/playlist
+  playlist_to_album /path/to/playlist convert_only
+        """
+    )
+    
+    parser.add_argument('folder', type=str, help='Path to playlist folder')
+    parser.add_argument('mode', nargs='?', default='full',
+                       choices=['convert_only', 'full', 'cleanup_only'],
+                       help='Processing mode (default: full)')
+    
+    args = parser.parse_args()
+    
+    # Validate folder exists
+    folder_path = Path(args.folder)
+    if not folder_path.exists():
+        print(f"ERROR: Folder does not exist: {folder_path}")
+        sys.exit(1)
+    
+    if not folder_path.is_dir():
+        print(f"ERROR: Not a directory: {folder_path}")
+        sys.exit(1)
+    
+    # Create processor and run
+    processor = PlaylistProcessor(folder_path, args.mode)
+    processor.run()
+
+
+if __name__ == "__main__":
+    main()
