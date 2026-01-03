@@ -115,6 +115,7 @@ MyPlaylist/
 
 - **Track Numbers**: Updated to reflect playlist position (e.g., `1/21`, `2/21`, etc.)
 - **Disc Numbers**: Always set to `1/1`
+- **Compilation Flag**: Set to `1` (marks the playlist as a compilation/mixtape)
 - **Artist & Title**: Preserved from original FLAC metadata
 - **Other Tags**: All other metadata remains unchanged
 

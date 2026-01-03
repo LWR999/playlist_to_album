@@ -162,6 +162,9 @@ class PlaylistProcessor:
         new_audio['tracknumber'] = f"{track_num}/{total_tracks}"
         new_audio['discnumber'] = "1/1"
         
+        # Set compilation flag (this is a mixtape) - Vorbis Comments standard
+        new_audio['COMPILATION'] = "1"
+        
         # Resize artwork if present
         if new_audio.pictures:
             self.log(f"  Resizing artwork for track {track_num}")
